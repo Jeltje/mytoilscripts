@@ -120,100 +120,94 @@ def return_input_paths(job, work_dir, ids, *args):
     return paths.values()
 
 
-def move_to_output_dir(work_dir, output_dir, uuid=None, files=list()):
-    """
-    Moves files from work_dir to output_dir
-
-    Input1: Working directory
-    Input2: Output directory
-    Input3: UUID to be preprended onto file name
-    Input4: list of file names to be moved from working dir to output dir
-    """
-    for fname in files:
-        if uuid is None:
-            shutil.move(os.path.join(work_dir, fname), os.path.join(output_dir, fname))
-        else:
-            shutil.move(os.path.join(work_dir, fname), os.path.join(output_dir, '{}.{}'.format(uuid, fname)))
-
-
 # Start of Job Functions
-def batch_start(job, input_args):
+######
+def download_shared_files(job, input_args):
     """
-    Downloads and places shared files that are used by all samples for alignment
+    Downloads shared files that are used by all samples for alignment and places them in the jobstore.
+
+    input_args: dict        Input arguments (passed from main())
     """
-    input_args['cpu_count'] = multiprocessing.cpu_count()
-    shared_files = ['ref.fa', 'ref.fa.fai', 'cent.bed', 'white.bed']
-    shared_ids = {x: job.fileStore.getEmptyFileStoreID() for x in shared_files}
+    shared_files = ['ref.fa', 'ref.fa.amb', 'ref.fa.ann', 'ref.fa.bwt', 'ref.fa.pac', 'ref.fa.sa', 'ref.fa.fai']
+    shared_ids = {}
     for fname in shared_files:
-        job.addChildJobFn(download_from_url, input_args, shared_ids, fname)
-    job.addFollowOnJobFn(spawn_batch_jobs, shared_ids, input_args)
+        url = input_args[fname]
+        shared_ids[fname] = job.addChildJobFn(download_from_url, url).rv()
+    job.addFollowOnJobFn(parse_config, shared_ids, input_args)
 
-
-def spawn_batch_jobs(job, shared_ids, input_args):
+def parse_config(job, shared_ids, input_args):
     """
-    Spawns a muse job for every sample in the input configuration file
+    Stores the UUID and urls associated with the input files to be retrieved.
+    Configuration file has one sample per line, with the following format:  UUID,1st_url,2nd_url
+
+    shared_ids: dict        Dictionary of fileStore IDs for the shared files downloaded in the previous step
+    input_args: dict        Input argumentts
     """
     samples = []
     config = input_args['config']
-    input_args['cpu_count'] = multiprocessing.cpu_count()
-    cores = input_args['cpu_count']
     with open(config, 'r') as f_in:
         for line in f_in:
-            uuid, c_url, t_url = line.strip().split(',')
-            samples.append((uuid, c_url, t_url))
+            line = line.strip().split(',')
+            uuid = line[0]
+            urls = line[1:]
+            samples.append((uuid, urls))
+    input_args['cpu_count'] = multiprocessing.cpu_count()
+    job_vars = (input_args, shared_ids)
     for sample in samples:
-        job.addChildJobFn(muse, shared_ids, input_args, sample, cores=cores)
-def muse(job, ids, input_args, sample):
-    """
-    Runs muse on the input bams for this sample
+        job.addChildJobFn(download_inputs, job_vars, sample, cores=input_args['cpu_count'], memory='20 G', disk='100 G')
 
-    Input1: Toil Job instance
-    Input2: jobstore id dictionary
-    Input3: Input arguments dictionary
-    Input4: Sample UUID and urls
+def download_inputs(job, job_vars, sample):
     """
-    uuid, c_url, t_url = sample
-    ids['vcf'] = job.fileStore.getEmptyFileStoreID()
+    Downloads the sample inputs (bam files)
+
+    job_vars: tuple         Contains the dictionaries: input_args and ids
+    sample: tuple           Contains the uuid (str) and urls (list of strings)
+    """
+    input_args, ids = job_vars
+    uuid, urls = sample
+    input_args['uuid'] = uuid
+    for i, file in enumerate(['control.bam', 'tumor.bam']):
+        if input_args['ssec']:
+            key_path = input_args['ssec']
+            ids[file] = job.addChildJobFn(download_encrypted_file, urls[i], key_path).rv()
+        else:
+            ids[file] = job.addChildJobFn(download_from_url, urls[i]).rv()
+    job.addFollowOnJobFn(run_muse, job_vars)
+
+def run_muse(job, job_vars):
+    """
+    This module runs the MuSE somatic mutation caller, which outputs vcf 
+
+    job_vars: tuple         Contains the dictionaries: input_args and ids
+    """
+    # Unpack variables
+    input_args, ids = job_vars
     work_dir = job.fileStore.getLocalTempDir()
-    output_dir = input_args['output_dir']
-    key_path = input_args['ssec']
+    sudo = input_args['sudo']
     cores = input_args['cpu_count']
+    # Retrieve samples
+    return_input_paths(job, work_dir, ids, 'tumor.bam', 'control.bam')
+    # Retrieve input files
+    return_input_paths(job, work_dir, ids, 'ref.fa', 'ref.fa.fai') 
 
-    # I/O
-    return_input_paths(job, work_dir, ids, 'ref.fa', 'ref.fa.fai', 'dbsnp.vcf') 
-
-    # Get bams associated with this sample
-    download_encrypted_file(work_dir, c_url, key_path, uuid + ".control.bam")
-    download_encrypted_file(work_dir, t_url, key_path, uuid + ".tumor.bam")
-
-
-####################
-    # Output VCF
-    uuid = input_args['uuid']
-    output_name = uuid + '.muse.vcf'
     # Call: MuSE
-
+    uuid = input_args['uuid']
+    muse_vcf = os.path.join(work_dir, uuid + '.muse.vcf')
     parameters = ['--muse', 'MuSEv1.0rc',
                   '--mode', 'wxs',
                   '--dbsnp', 'dbsnp.vcf',
-                  '--fafile', 'ref.fasta',
+                  '--fafile', 'ref.fa',
                   '--tumor-bam', 'tumor.bam',
-                  #'--tumor-bam-index', 'tumor.bam.bai',
                   '--normal-bam', 'normal.bam',
-                  #'--normal-bam-index', 'normal.bam.bai',
-                  '--outfile', docker_path(output_name),
-                  '--cpus', int(input_args['cpu_count'])]   # check that this works!
+                  '--outfile', docker_path(muse_vcf),
+                  '--cpus', str(cores)]
     docker_call(work_dir=work_dir, tool_parameters=parameters,
                 tool='jeltje/musev1.0', sudo=sudo)
 
-    # Save in JobStore
-    job.fileStore.updateGlobalFile(ids['vcf'], os.path.join(work_dir, output_name))
-    # Move file in output_dir
-    if input_args['output_dir']:
-        move_to_output_dir(work_dir, output_dir, uuid=None, files=[output_name])
-    # Copy file to S3
+    ids['muse_vcf'] = job.fileStore.writeGlobalFile(muse_vcf)
     if input_args['s3_dir']:
-        job.addChildJobFn(upload_file_to_s3, ids, input_args, sample[0], cores=cores)
+        job.addChildJobFn(upload_to_s3, job_vars, disk='80G')
+
 
 def docker_path(file_path):
     """
@@ -249,34 +243,33 @@ def docker_call(work_dir, tool_parameters, tool, java_opts=None, outfile=None, s
         raise RuntimeError('docker not found on system. Install on all nodes.')
 
 
-def upload_file_to_s3(job, ids, input_args, uuid):
+def upload_to_s3(job, job_vars):
     """
-    Uploads output file from sample to S3
+    Uploads a file to S3 via S3AM 
 
-    Input1: Toil Job instance
-    Input2: jobstore id dictionary
-    Input3: Input arguments dictionary
-    Input4: Sample uuid
+    job_vars: tuple         Contains the dictionaries: input_args and ids
     """
-    work_dir = job.fileStore.getLocalTempDir()
+    # Unpack variables
+    input_args, ids = job_vars
+    uuid = input_args['uuid']
     key_path = input_args['ssec']
+    work_dir = job.fileStore.getLocalTempDir()
     # Parse s3_dir to get bucket and s3 path
     s3_dir = input_args['s3_dir']
-    bucket_name = s3_dir.split('/')[0]
-    bucket_dir = '/'.join(s3_dir.split('/')[1:])
+    bucket_name = s3_dir.lstrip('/').split('/')[0]
+    bucket_dir = '/'.join(s3_dir.lstrip('/').split('/')[1:])
     base_url = 'https://s3-us-west-2.amazonaws.com/'
-    outfile = uuid + 'muse.vcf'
-    url = os.path.join(base_url, bucket_name, bucket_dir, outfile)
-    #I/O
-    job.fileStore.readGlobalFile(ids['vcf'], os.path.join(work_dir, outfile))
-    # Command to upload to S3 via S3AM
+    url = os.path.join(base_url, bucket_name, bucket_dir, uuid + '.muse.vcf')
+    # Retrieve file to be uploaded
+    job.fileStore.readGlobalFile(ids['muse_vcf'], os.path.join(work_dir, uuid + '.muse.vcf'))
+    # Upload to S3 via S3AM
     s3am_command = ['s3am',
                     'upload',
-                    'file://{}'.format(os.path.join(work_dir, outfile)),
+                    'file://{}'.format(os.path.join(work_dir, uuid + '.muse.vcf')),
                     bucket_name,
-                    os.path.join(bucket_dir, outfile)]
-
+                    os.path.join(bucket_dir, uuid + '.bam')]
     subprocess.check_call(s3am_command)
+
 
 
 if __name__ == "__main__":
@@ -290,7 +283,6 @@ if __name__ == "__main__":
               'ref.fa': args.ref,
               'ref.fa.fai': args.fai,
               'ssec':args.ssec,
-              'output_dir': args.out,
               's3_dir': args.s3_dir,
               'cpu_count': None}
 
