@@ -12,8 +12,8 @@
 # Modify first argument to change location of the local fileStore
 # Uncomment the final line to resume your Toil job in the event of job failure.
 python toil_muse.py \
-aws:us-west-2:jeltje-muse-run-1 \
---retryCount 3 \
+aws:us-west-2:jeltje-muse-run-2 \
+--retryCount 0 \
 --config /home/mesosbox/shared/exome_variant_config.csv \
 --ref "https://s3-us-west-2.amazonaws.com/cgl-pipeline-inputs/alignment/hg19.fa" \
 --fai "https://s3-us-west-2.amazonaws.com/cgl-pipeline-inputs/alignment/hg19.fa.fai" \

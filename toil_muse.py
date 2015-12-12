@@ -33,6 +33,9 @@ def build_parser():
     parser.add_argument('-o', '--out', default=None, help='full path where final results will be output')
     parser.add_argument('-3', '--s3_dir', default=None, help='S3 Directory, starting with bucket name. e.g.: '
                                                              'cgl-driver-projects/ckcc/rna-seq-samples/')
+    parser.add_argument('-u', '--sudo', dest='sudo', action='store_true', help='Docker usually needs sudo to execute '
+                                                                               'locally, but not''when running Mesos '
+                                                                               'or when a member of a Docker group.')
     return parser
 
 
@@ -52,18 +55,23 @@ def generate_unique_key(master_key_path, url):
     assert len(new_key) == 32, 'New key is invalid and is not 32 characters: {}'.format(new_key)
     return new_key
 
-
-def download_encrypted_file(work_dir, url, key_path, name):
+def download_encrypted_file(job, url, key_path):
     """
-    Downloads encrypted file from S3
+    Downloads encrypted files from S3 via header injection
 
-    Input1: Working directory
-    Input2: S3 URL to be downloaded
-    Input3: Path to key necessary for decryption
-    Input4: name of file to be downloaded
+    url: str        URL to be downloaded
+    key_path: str   Path to the master key needed to derive unique encryption keys per file
     """
-    file_path = os.path.join(work_dir, name)
+    work_dir = job.fileStore.getLocalTempDir()
+    file_path = os.path.join(work_dir, os.path.basename(url))
+
+    with open(key_path, 'r') as f:
+        key = f.read()
+    if len(key) != 32:
+        raise RuntimeError('Invalid Key! Must be 32 bytes: {}'.format(key))
+
     key = generate_unique_key(key_path, url)
+
     encoded_key = base64.b64encode(key)
     encoded_key_md5 = base64.b64encode(hashlib.md5(key).digest())
     h1 = 'x-amz-server-side-encryption-customer-algorithm:AES256'
@@ -74,26 +82,25 @@ def download_encrypted_file(work_dir, url, key_path, name):
     except OSError:
         raise RuntimeError('Failed to find "curl". Install via "apt-get install curl"')
     assert os.path.exists(file_path)
+    return job.fileStore.writeGlobalFile(file_path)
 
-def download_from_url(job, input_args, ids, name):
+
+def download_from_url(job, url):
     """
-    Downloads a file from a URL and places it in the jobStore
+    Downloads a URL that was supplied as an argument to running this script in LocalTempDir.
+    After downloading the file, it is stored in the FileStore.
 
-    Input1: Toil job instance
-    Input2: Input arguments
-    Input3: jobstore id dictionary
-    Input4: Name of key used to access url in input_args
+    url: str        URL to be downloaded. filename is derived from URL
     """
     work_dir = job.fileStore.getLocalTempDir()
-    file_path = os.path.join(work_dir, name)
-    url = input_args[name]
+    file_path = os.path.join(work_dir, os.path.basename(url))
     if not os.path.exists(file_path):
         try:
             subprocess.check_call(['curl', '-fs', '--retry', '5', '--create-dir', url, '-o', file_path])
         except OSError:
             raise RuntimeError('Failed to find "curl". Install via "apt-get install curl"')
     assert os.path.exists(file_path)
-    job.fileStore.updateGlobalFile(ids[name], file_path)
+    return job.fileStore.writeGlobalFile(file_path)
 
 
 def return_input_paths(job, work_dir, ids, *args):
@@ -128,7 +135,7 @@ def download_shared_files(job, input_args):
 
     input_args: dict        Input arguments (passed from main())
     """
-    shared_files = ['ref.fa', 'ref.fa.amb', 'ref.fa.ann', 'ref.fa.bwt', 'ref.fa.pac', 'ref.fa.sa', 'ref.fa.fai']
+    shared_files = ['ref.fa', 'ref.fa.fai', 'dbsnp.vcf']
     shared_ids = {}
     for fname in shared_files:
         url = input_args[fname]
@@ -154,7 +161,8 @@ def parse_config(job, shared_ids, input_args):
     input_args['cpu_count'] = multiprocessing.cpu_count()
     job_vars = (input_args, shared_ids)
     for sample in samples:
-        job.addChildJobFn(download_inputs, job_vars, sample, cores=input_args['cpu_count'], memory='20 G', disk='100 G')
+        job.addChildJobFn(download_inputs, job_vars, sample, cores=input_args['cpu_count'])
+        #job.addChildJobFn(download_inputs, job_vars, sample, cores=input_args['cpu_count'], memory='20 G', disk='100 G')
 
 def download_inputs(job, job_vars, sample):
     """
@@ -188,17 +196,16 @@ def run_muse(job, job_vars):
     # Retrieve samples
     return_input_paths(job, work_dir, ids, 'tumor.bam', 'control.bam')
     # Retrieve input files
-    return_input_paths(job, work_dir, ids, 'ref.fa', 'ref.fa.fai') 
+    return_input_paths(job, work_dir, ids, 'ref.fa', 'ref.fa.fai', 'dbsnp.vcf') 
 
     # Call: MuSE
     uuid = input_args['uuid']
     muse_vcf = os.path.join(work_dir, uuid + '.muse.vcf')
-    parameters = ['--muse', 'MuSEv1.0rc',
-                  '--mode', 'wxs',
+    parameters = ['--mode', 'wxs',
                   '--dbsnp', 'dbsnp.vcf',
                   '--fafile', 'ref.fa',
                   '--tumor-bam', 'tumor.bam',
-                  '--normal-bam', 'normal.bam',
+                  '--normal-bam', 'control.bam',
                   '--outfile', docker_path(muse_vcf),
                   '--cpus', str(cores)]
     docker_call(work_dir=work_dir, tool_parameters=parameters,
@@ -267,7 +274,7 @@ def upload_to_s3(job, job_vars):
                     'upload',
                     'file://{}'.format(os.path.join(work_dir, uuid + '.muse.vcf')),
                     bucket_name,
-                    os.path.join(bucket_dir, uuid + '.bam')]
+                    os.path.join(bucket_dir, uuid + '.muse.vcf')]
     subprocess.check_call(s3am_command)
 
 
@@ -282,9 +289,11 @@ if __name__ == "__main__":
     inputs = {'config': args.config,
               'ref.fa': args.ref,
               'ref.fa.fai': args.fai,
+              'dbsnp.vcf': args.dbsnp,
+              'sudo': args.sudo,
               'ssec':args.ssec,
               's3_dir': args.s3_dir,
               'cpu_count': None}
 
     # Launch jobs
-    Job.Runner.startToil(Job.wrapJobFn(batch_start, inputs), args)
+    Job.Runner.startToil(Job.wrapJobFn(download_shared_files, inputs), args)
