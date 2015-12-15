@@ -180,7 +180,7 @@ def download_inputs(job, job_vars, sample):
             ids[file] = job.addChildJobFn(download_encrypted_file, urls[i], key_path).rv()
         else:
             ids[file] = job.addChildJobFn(download_from_url, urls[i]).rv()
-    job.addFollowOnJobFn(run_muse, job_vars)
+    job.addFollowOnJobFn(run_muse, job_vars, cores=job_vars['cpu_count'])
 
 def run_muse(job, job_vars):
     """
