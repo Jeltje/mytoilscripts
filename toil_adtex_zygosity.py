@@ -200,25 +200,22 @@ def run_adtex(job, job_vars):
 
     # Call: Adtex
     uuid = input_args['uuid']
-    #### WORK HERE (must be ready to tar output)
-    # FIXME muse_vcf = os.path.join(work_dir, uuid + '.muse.vcf')
-    parameters = ['-n', 'control.cov'.format(uuid + '.control.coverage'),
-                '-t', 'tumor.cov'.format(uuid + '.tumor.coverage'),
+    adtexOut = uuid + '.adtex_out'
+    parameters = ['-n', 'control.cov'
+                '-t', 'tumor.cov'
                 '-b', 'white.bed',
-                '-o', 'adtex_out',
+                '-o', '{}'.format(adtexOut),
                 '-p', '--estimatePloidy', 
                 '--baf', 'sample.baf' ]
     docker_call(work_dir=work_dir, tool_parameters=parameters,
                 tool='jeltje/adtex', sudo=sudo)
-    outtar = os.path.join(work_dir, uuid + 'adtex.tgz')
-    make_tarfile(outtar, (os.path.join(work_dir, outdir)))
-    # Save in JobStore - I think this is no longer correct, must check
-    job.fileStore.updateGlobalFile(ids['tgz'], outtar)
+    outtar = os.path.join(work_dir, uuid + '.adtex.tgz')
+    make_tarfile(outtar, (os.path.join(work_dir, adtexOut)))
+    # Write to FileStore
+    ids['tgz'] = job.fileStore.writeGlobalFile(outtar)
 
-
-    #ids['muse_vcf'] = job.fileStore.writeGlobalFile(muse_vcf)
     if input_args['s3_dir']:
-        job.addChildJobFn(upload_to_s3, job_vars, disk='80G')
+        job.addChildJobFn(upload_to_s3, job_vars, outtar)
 
 
 def docker_path(file_path):
@@ -259,7 +256,7 @@ def make_tarfile(output_filename, source_dir):
         tar.add(source_dir, arcname=os.path.basename(source_dir))
 
 
-def upload_to_s3(job, job_vars):
+def upload_to_s3(job, job_vars, outfile):
     """
     Uploads a file to S3 via S3AM 
 
@@ -267,7 +264,7 @@ def upload_to_s3(job, job_vars):
     """
     # Unpack variables
     input_args, ids = job_vars
-    uuid = input_args['uuid']
+    #uuid = input_args['uuid']
     key_path = input_args['ssec']
     work_dir = job.fileStore.getLocalTempDir()
     # Parse s3_dir to get bucket and s3 path
@@ -275,15 +272,15 @@ def upload_to_s3(job, job_vars):
     bucket_name = s3_dir.lstrip('/').split('/')[0]
     bucket_dir = '/'.join(s3_dir.lstrip('/').split('/')[1:])
     base_url = 'https://s3-us-west-2.amazonaws.com/'
-    # FIXME url = os.path.join(base_url, bucket_name, bucket_dir, uuid + '.muse.vcf')
+    url = os.path.join(base_url, bucket_name, bucket_dir, outfile)
     # Retrieve file to be uploaded
-    # FIXME job.fileStore.readGlobalFile(ids['muse_vcf'], os.path.join(work_dir, uuid + '.muse.vcf'))
+    job.fileStore.readGlobalFile(ids['tgz'], os.path.join(work_dir, outfile))
     # Upload to S3 via S3AM
     s3am_command = ['s3am',
                     'upload',
-    # FIXME                'file://{}'.format(os.path.join(work_dir, uuid + '.muse.vcf')),
+                    'file://{}'.format(os.path.join(work_dir, outfile)),
                     bucket_name,
-    # FIXME                os.path.join(bucket_dir, uuid + '.muse.vcf')]
+                    os.path.join(bucket_dir, outfile)]
     subprocess.check_call(s3am_command)
 
 
