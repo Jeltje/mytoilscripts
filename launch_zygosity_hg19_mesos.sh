@@ -15,7 +15,7 @@ python toil_adtex_zygosity.py \
 aws:us-west-2:jeltje-zy-adtex-run-1 \
 --retryCount 0 \
 --config /home/mesosbox/shared/zygosity_config.csv \
---white https://s3-us-west-2.amazonaws.com/varscan-hg19-input/SeqCapTargets.bed 
+--white https://s3-us-west-2.amazonaws.com/varscan-hg19-input/SeqCapTargets.bed \
 --ssec '/home/mesosbox/shared/master.key' \
 --s3_dir 'cgl-driver-projects/wcdt/variants/' \
 --sseKey=/home/mesosbox/shared/master.key \

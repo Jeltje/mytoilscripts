@@ -155,7 +155,7 @@ def parse_config(job, shared_ids, input_args):
             line = line.strip().split(',')
             uuid = line[0]
             # there are three urls: one baf file and two coverage files
-            urls = line[2:]
+            urls = line[1:]
             samples.append((uuid, urls))
     input_args['cpu_count'] = multiprocessing.cpu_count()
     job_vars = (input_args, shared_ids)
@@ -171,15 +171,16 @@ def download_inputs(job, job_vars, sample):
     sample: tuple           Contains the uuid (str) and urls (list of strings)
     """
     input_args, ids = job_vars
-    uuid, baf, urls = sample
+    uuid, urls = sample
     input_args['uuid'] = uuid
-    for i, file in enumerate(['sample.baf', 'control.cov', 'tumor.cov']):
+    ids['sample.baf']  = job.addChildJobFn(download_from_url, urls[0]).rv()
+    for i, file in enumerate(['control.cov', 'tumor.cov']):
         if input_args['ssec']:
             key_path = input_args['ssec']
-            ids[file] = job.addChildJobFn(download_encrypted_file, urls[i], key_path).rv()
+            ids[file] = job.addChildJobFn(download_encrypted_file, urls[i+1], key_path).rv()
         else:
-            ids[file] = job.addChildJobFn(download_from_url, urls[i]).rv()
-    job.addFollowOnJobFn(run_adtex, job_vars, cores=job_vars['cpu_count'])
+            ids[file] = job.addChildJobFn(download_from_url, urls[i+1]).rv()
+    job.addFollowOnJobFn(run_adtex, job_vars, cores=input_args['cpu_count'])
 
 def run_adtex(job, job_vars):
     """
