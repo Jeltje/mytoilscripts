@@ -21,5 +21,6 @@ aws:us-west-2:jeltje-zy-adtex-run-1 \
 --sseKey=/home/mesosbox/shared/master.key \
 --batchSystem="mesos" \
 --mesosMaster=mesos-master:5050 \
---workDir=/var/lib/toil \
+--workDir=/var/lib/toil 
+#--sudo \
 #--restart

@@ -1,9 +1,18 @@
 #!/usr/bin/env python2.7
 #Jeltje van Baren 
 """
-Batch script using Toil
-
 Runs adtex on input coverage and baf files.
+
+     Tree Structure of ADTEx Pipeline
+     0 --> 1 --> 2 --> 3 --> 4
+
+0 = Start Node
+1 = Download whitelist bed file
+2 = Download bam and baf files
+3 = Create coverage files
+4 = Run Adtex
+
+Batch script using Toil
 
 Dependencies:
 Docker  -   apt-get install docker.io
@@ -31,7 +40,7 @@ def build_parser():
     parser.add_argument('-o', '--out', default=None, help='full path where final results will be output')
     parser.add_argument('-3', '--s3_dir', default=None, help='S3 Directory, starting with bucket name. e.g.: '
                                                              'cgl-driver-projects/ckcc/rna-seq-samples/')
-    parser.add_argument('-u', '--sudo', dest='sudo', action='store_true', help='Docker usually needs sudo to execute '
+    parser.add_argument('-u', '--sudo', dest='sudo', action='store_true', default=False, help='Docker usually needs sudo to execute '
                                                                                'locally, but not''when running Mesos '
                                                                                'or when a member of a Docker group.')
     return parser
@@ -154,7 +163,7 @@ def parse_config(job, shared_ids, input_args):
         for line in f_in:
             line = line.strip().split(',')
             uuid = line[0]
-            # there are three urls: one baf file and two coverage files
+            # there are three urls: one baf file and two bam files
             urls = line[1:]
             samples.append((uuid, urls))
     input_args['cpu_count'] = multiprocessing.cpu_count()
@@ -165,7 +174,7 @@ def parse_config(job, shared_ids, input_args):
 
 def download_inputs(job, job_vars, sample):
     """
-    Downloads the sample inputs (coverage and baf files)
+    Downloads the sample inputs (bam and baf files)
 
     job_vars: tuple         Contains the dictionaries: input_args and ids
     sample: tuple           Contains the uuid (str) and urls (list of strings)
@@ -174,17 +183,44 @@ def download_inputs(job, job_vars, sample):
     uuid, urls = sample
     input_args['uuid'] = uuid
     ids['sample.baf']  = job.addChildJobFn(download_from_url, urls[0]).rv()
-    for i, file in enumerate(['control.cov', 'tumor.cov']):
-        if input_args['ssec']:
-            key_path = input_args['ssec']
-            ids[file] = job.addChildJobFn(download_encrypted_file, urls[i+1], key_path).rv()
-        else:
-            ids[file] = job.addChildJobFn(download_from_url, urls[i+1]).rv()
+    key_path = input_args['ssec']
+    ids['control.bam'] = job.addChildJobFn(download_encrypted_file, urls[1], key_path).rv()
+    ids['tumor.bam']   = job.addChildJobFn(download_encrypted_file, urls[2], key_path).rv()
+    job.addFollowOnJobFn(bam_to_coverage, job_vars, cores=input_args['cpu_count'])
+
+def bam_to_coverage(job, job_vars):
+    """
+    job_vars: tuple         Contains the dictionaries: input_args and ids
+    """
+    input_args, ids = job_vars
+    ids['control.cov'] = job.addChildJobFn(bedtools_coverage, 'control.bam', job_vars).rv()
+    ids['tumor.cov'] = job.addChildJobFn(bedtools_coverage, 'tumor.bam', job_vars).rv()
     job.addFollowOnJobFn(run_adtex, job_vars, cores=input_args['cpu_count'])
+
+def bedtools_coverage(work_dir, bamfile, job_vars):
+    """
+    Runs bedtools coverage on input bam and returns coverage file
+    
+    """
+#docker run --log-driver=none --rm -v /data/data/general:/data jvivian/bedtools coverage -abam $tumor -d -b $targets >  wcdt_T.cov
+    # Unpack variables
+    input_args, ids = job_vars
+    work_dir = job.fileStore.getLocalTempDir()
+    sudo = input_args['sudo']
+    covfile = 'out.cov'
+    file_path = os.path.join(work_dir, covfile)
+    # Retrieve sample
+    return_input_paths(job, work_dir, ids, bamfile)
+    parameters = ['-abam', '{}'.format(bamfile),
+                  '-d',
+                  '-b', 'white.bed']
+    docker_call(work_dir=work_dir, tool_parameters=parameters,
+                tool='jvivian/bedtools', outfile=covfile, sudo=sudo)
+    return job.fileStore.writeGlobalFile(file_path)
 
 def run_adtex(job, job_vars):
     """
-    This module runs the Adtes variant caller including zygosity output. The output is a directory of files
+    This module runs the ADTEx variant caller including zygosity output. The output is a directory of files
     which should be tarred
 
     job_vars: tuple         Contains the dictionaries: input_args and ids
@@ -202,8 +238,8 @@ def run_adtex(job, job_vars):
     # Call: Adtex
     uuid = input_args['uuid']
     adtexOut = uuid + '.adtex_out'
-    parameters = ['-n', 'control.cov'
-                '-t', 'tumor.cov'
+    parameters = ['-n', 'control.cov',
+                '-t', 'tumor.cov',
                 '-b', 'white.bed',
                 '-o', '{}'.format(adtexOut),
                 '-p', '--estimatePloidy', 
@@ -237,7 +273,7 @@ def docker_call(work_dir, tool_parameters, tool, java_opts=None, outfile=None, s
     outfile: file           Filehandle that stderr will be passed to
     sudo: bool              If the user wants the docker command executed as sudo
     """
-    base_docker_call = 'docker run --rm -v {}:/data'.format(work_dir).split()
+    base_docker_call = 'docker run --log-driver=none --rm -v {}:/data'.format(work_dir).split()
     if sudo:
         base_docker_call = ['sudo'] + base_docker_call
     if java_opts:
@@ -292,12 +328,13 @@ if __name__ == "__main__":
     Job.Runner.addToilOptions(parser)
     args = parser.parse_args()
 
-    # Store input_URLs for downloading
+    # Store inputs
     inputs = {'config': args.config,
               'white.bed': args.white,
               'ssec':args.ssec,
               'output_dir': args.out,
               's3_dir': args.s3_dir,
+              'sudo': args.sudo,
               'cpu_count': None}
 
     # Launch jobs
